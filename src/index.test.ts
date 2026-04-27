@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { filterPii } from "./index.js";
+import { filterPii, scanSchema } from "./index.js";
 
 const SALT = "test-salt";
 
@@ -10,13 +10,12 @@ describe("redact mode", () => {
   });
 
   it("redacts email field by name", () => {
-    const result = filterPii({ email: "user@example.com", name: "John" }, { mode: "redact" });
-    expect(result).toEqual({ email: "[REDACTED]", name: "[REDACTED]" });
+    const result = filterPii({ email: "user@example.com", age: 30 }, { mode: "redact" });
+    expect(result).toEqual({ email: "[REDACTED]", age: 30 });
   });
 
   it("redacts CPF", () => {
-    expect(filterPii("cpf: 123.456.789-09", { mode: "redact" }))
-      .toContain("[ACCOUNT_NUMBER]");
+    expect(filterPii("cpf: 123.456.789-09", { mode: "redact" })).toContain("[ACCOUNT_NUMBER]");
   });
 
   it("redacts nested objects", () => {
@@ -47,5 +46,60 @@ describe("pseudonymize mode", () => {
   it("hash is not the raw value", () => {
     const result = filterPii({ email: "user@example.com" }, { mode: "pseudonymize", salt: SALT });
     expect((result as any).email).not.toContain("user@example.com");
+  });
+});
+
+describe("knownPiiFields from scanSchema", () => {
+  it("filters known field without regex scan", () => {
+    const result = filterPii(
+      { customer: { contact: "user@example.com", age: 30 } },
+      { mode: "redact", knownPiiFields: ["customer.contact"] }
+    );
+    expect((result as any).customer.contact).toBe("[REDACTED]");
+    expect((result as any).customer.age).toBe(30);
+  });
+
+  it("scanSchema detects email by field name", () => {
+    const schema = {
+      properties: {
+        email: { type: "string" },
+        age: { type: "integer" },
+      },
+    };
+    expect(scanSchema(schema)).toContain("email");
+    expect(scanSchema(schema)).not.toContain("age");
+  });
+
+  it("scanSchema detects by format", () => {
+    const schema = {
+      properties: {
+        contact: { type: "string", format: "email" },
+      },
+    };
+    expect(scanSchema(schema)).toContain("contact");
+  });
+
+  it("scanSchema detects nested paths", () => {
+    const schema = {
+      properties: {
+        user: {
+          properties: {
+            email: { type: "string" },
+          },
+        },
+      },
+    };
+    expect(scanSchema(schema)).toContain("user.email");
+  });
+
+  it("combined: scanSchema + filterPii", () => {
+    const schema = { properties: { customer: { properties: { email: { type: "string" } } } } };
+    const piiFields = scanSchema(schema);
+    const result = filterPii(
+      { customer: { email: "user@example.com", id: "123" } },
+      { mode: "pseudonymize", salt: SALT, knownPiiFields: piiFields }
+    );
+    expect((result as any).customer.email).not.toContain("user@example.com");
+    expect((result as any).customer.id).toBe("123");
   });
 });

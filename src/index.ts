@@ -1,9 +1,47 @@
 import { createHash } from "node:crypto";
 import { PII_PATTERNS, PII_FIELD_NAMES } from "./patterns.js";
 
-export type RedactOptions = { mode: "redact" };
-export type PseudonymizeOptions = { mode: "pseudonymize"; salt: string };
+export type RedactOptions = { mode: "redact"; knownPiiFields?: string[] };
+export type PseudonymizeOptions = { mode: "pseudonymize"; salt: string; knownPiiFields?: string[] };
 export type FilterOptions = RedactOptions | PseudonymizeOptions;
+
+/**
+ * Scan an OpenAPI schema object and return dot-notation paths of PII fields.
+ * Pass the result as `knownPiiFields` to filterPii() for faster, precise filtering.
+ *
+ * @example
+ * const schema = { customer: { email: { type: "string", format: "email" }, age: { type: "integer" } } }
+ * scanSchema(schema) // → ["customer.email"]
+ */
+export function scanSchema(schema: Record<string, unknown>, prefix = ""): string[] {
+  const piiFields: string[] = [];
+
+  for (const [key, value] of Object.entries(schema)) {
+    const path = prefix ? `${prefix}.${key}` : key;
+
+    if (key === "properties" && typeof value === "object" && value !== null) {
+      piiFields.push(...scanSchema(value as Record<string, unknown>, prefix));
+      continue;
+    }
+
+    if (typeof value === "object" && value !== null) {
+      const prop = value as Record<string, unknown>;
+      const isPiiByName = PII_FIELD_NAMES.has(key.toLowerCase());
+      const isPiiByFormat = typeof prop.format === "string" &&
+        ["email", "password", "phone", "uri"].includes(prop.format);
+      const isPiiByDescription = typeof prop.description === "string" &&
+        /\b(pii|personal|private|sensitive|confidential)\b/i.test(prop.description);
+
+      if (isPiiByName || isPiiByFormat || isPiiByDescription) {
+        piiFields.push(path);
+      } else {
+        piiFields.push(...scanSchema(prop, path));
+      }
+    }
+  }
+
+  return piiFields;
+}
 
 function hashValue(value: string, salt: string): string {
   return createHash("sha256").update(salt + value).digest("hex").slice(0, 16);
@@ -24,38 +62,55 @@ function filterString(text: string, options: FilterOptions): string {
   return result;
 }
 
-function filterValue(value: unknown, options: FilterOptions): unknown {
+function filterValue(value: unknown, options: FilterOptions, currentPath: string): unknown {
   if (typeof value === "string") return filterString(value, options);
-  if (Array.isArray(value)) return value.map((v) => filterValue(v, options));
-  if (value !== null && typeof value === "object") return filterObject(value as Record<string, unknown>, options);
+  if (Array.isArray(value)) return value.map((v) => filterValue(v, options, currentPath));
+  if (value !== null && typeof value === "object") return filterObject(value as Record<string, unknown>, options, currentPath);
   return value;
 }
 
-function filterObject(obj: Record<string, unknown>, options: FilterOptions): Record<string, unknown> {
+function isKnownPiiPath(path: string, knownPiiFields: string[]): boolean {
+  return knownPiiFields.some((f) => f === path || path.startsWith(f + "."));
+}
+
+function filterObject(
+  obj: Record<string, unknown>,
+  options: FilterOptions,
+  parentPath = ""
+): Record<string, unknown> {
+  const knownPiiFields = options.knownPiiFields ?? [];
   const result: Record<string, unknown> = {};
+
   for (const [key, val] of Object.entries(obj)) {
-    const isPiiField = PII_FIELD_NAMES.has(key.toLowerCase());
-    if (isPiiField && typeof val === "string") {
+    const path = parentPath ? `${parentPath}.${key}` : key;
+    const isPiiByKnownField = isKnownPiiPath(path, knownPiiFields);
+    const isPiiByName = PII_FIELD_NAMES.has(key.toLowerCase());
+
+    if ((isPiiByKnownField || isPiiByName) && typeof val === "string") {
       result[key] = replaceValue(val, options);
     } else {
-      result[key] = filterValue(val, options);
+      result[key] = filterValue(val, options, path);
     }
   }
+
   return result;
 }
 
 /**
  * Filter PII from a string or JSON object.
  *
- * @example
- * // Redact — removes PII irreversibly
- * filterPii({ email: "user@example.com" }, { mode: "redact" })
- * // → { email: "[REDACTED]" }
+ * Optionally pass `knownPiiFields` (dot-notation paths from `scanSchema()`)
+ * to skip regex scanning on fields already identified from the OpenAPI schema.
  *
  * @example
- * // Pseudonymize — deterministic SHA256+salt (GDPR-compliant with secret salt)
- * filterPii({ email: "user@example.com" }, { mode: "pseudonymize", salt: process.env.PII_SALT! })
- * // → { email: "[a3f8c2d1e4b5f6a7]" }
+ * // With schema-derived field list (faster, more precise)
+ * const piiFields = scanSchema(openApiSchema);
+ * filterPii(response, { mode: "pseudonymize", salt: process.env.PII_SALT!, knownPiiFields: piiFields })
+ *
+ * @example
+ * // Without schema (regex-only detection)
+ * filterPii({ email: "user@example.com" }, { mode: "redact" })
+ * // → { email: "[REDACTED]" }
  */
 export function filterPii(input: string, options: FilterOptions): string;
 export function filterPii(input: Record<string, unknown>, options: FilterOptions): Record<string, unknown>;
